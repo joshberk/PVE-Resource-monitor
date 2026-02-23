@@ -1,29 +1,49 @@
 # PVE-Resource-Monitor
 
-A Python-based telemetry tool for Proxmox Virtual Environments running on Supermicro hardware. This script provides daily resource utilization reports and real-time hardware power consumption stats via Slack.
+A Python telemetry tool for Proxmox VE running on Supermicro hardware. It sends a daily Slack report with real-time host power draw plus per-VM CPU and RAM usage.
 
-## 🚀 Features
-- **VM Utilization**: Tracks CPU and RAM usage for all active virtual machines.
-- **Hardware Telemetry**: Pulls real-time power draw (Watts) directly from Supermicro BMC via IPMI.
-- **Slack Integration**: Formats data into a clean, scannable report delivered to a dedicated Slack channel.
-- **Lightweight**: Uses native Proxmox `pvesh` and `ipmitool` to avoid heavy API overhead.
+## Features
+- VM utilization for running QEMU guests
+- Instantaneous power draw via IPMI (`ipmitool dcmi power reading`)
+- Slack incoming webhook delivery
+- Lightweight host-side monitoring using native `pvesh` and `ipmitool`
 
-## 🛠️ Requirements
-- Proxmox VE 8.x+
-- Python 3.x
-- `ipmitool` installed on host
-- A Slack Incoming Webhook URL
+## Requirements
+- Proxmox VE host with `pvesh`
+- Python 3
+- `ipmitool`
+- Python package: `requests`
+- Slack Incoming Webhook URL
 
-## 📈 Monitoring Logic
-The script executes the following logic flow:
-1. Queries the Proxmox API for the state of all QEMU guests.
-2. Interfaces with the Supermicro SDR (Sensor Data Repository) for instantaneous wattage.
-3. Calculates mean resource consumption across the node.
-4. Pushes an automated payload to the Slack Webhook.
+## Script
+Main script: `lab_report.py`
 
+Install Python dependency:
 
-
-## 📅 Scheduling
-To run this automatically every morning at 08:00, add the following to your crontab:
 ```bash
-0 8 * * * /usr/bin/python3 /path/to/lab_report.py
+python3 -m pip install -r requirements.txt
+```
+
+### Configuration
+Set environment variables before running:
+
+```bash
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+export PVE_NODE_NAME="node1"
+```
+
+Notes:
+- `SLACK_WEBHOOK_URL` is required.
+- `PVE_NODE_NAME` defaults to `node1` if not set.
+
+### Run
+```bash
+python3 lab_report.py
+```
+
+## Scheduling (cron)
+Run every day at 08:00:
+
+```bash
+0 8 * * * SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ" PVE_NODE_NAME="node1" /usr/bin/python3 /path/to/lab_report.py
+```
