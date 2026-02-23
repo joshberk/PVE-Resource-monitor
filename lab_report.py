@@ -3,9 +3,26 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import requests
 
+
+def load_dotenv(dotenv_path: Path) -> None:
+    if not dotenv_path.exists():
+        return
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 NODE_NAME = os.getenv("PVE_NODE_NAME", "node1").strip()

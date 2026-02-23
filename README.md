@@ -25,16 +25,24 @@ python3 -m pip install -r requirements.txt
 ```
 
 ### Configuration
-Set environment variables before running:
+Use a local `.env` file (recommended) so secrets are not committed:
 
 ```bash
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
-export PVE_NODE_NAME="node1"
+cp .env.example .env
+chmod 600 .env
+```
+
+Then edit `.env`:
+
+```bash
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+PVE_NODE_NAME=node1
 ```
 
 Notes:
 - `SLACK_WEBHOOK_URL` is required.
 - `PVE_NODE_NAME` defaults to `node1` if not set.
+- `.env` is ignored by git via `.gitignore`.
 
 ### Run
 ```bash
@@ -45,5 +53,5 @@ python3 lab_report.py
 Run every day at 08:00:
 
 ```bash
-0 8 * * * SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ" PVE_NODE_NAME="node1" /usr/bin/python3 /path/to/lab_report.py
+0 8 * * * cd /path/to/PVE-Resource-monitor && /usr/bin/python3 /path/to/PVE-Resource-monitor/lab_report.py
 ```
