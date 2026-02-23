@@ -5,6 +5,7 @@ A Python telemetry tool for Proxmox VE running on Supermicro hardware. It sends 
 ## Features
 - VM utilization for running QEMU guests
 - Instantaneous power draw via IPMI (`ipmitool dcmi power reading`)
+- Sensor anomaly detection from IPMI SDR output
 - Slack incoming webhook delivery
 - Lightweight host-side monitoring using native `pvesh` and `ipmitool`
 
@@ -37,11 +38,13 @@ Then edit `.env`:
 ```bash
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
 PVE_NODE_NAME=node1
+FAIL_ON_CRITICAL_ALERTS=false
 ```
 
 Notes:
 - `SLACK_WEBHOOK_URL` is required.
 - `PVE_NODE_NAME` defaults to `node1` if not set.
+- `FAIL_ON_CRITICAL_ALERTS=true` makes the script exit non-zero when critical sensor alerts are detected.
 - `.env` is ignored by git via `.gitignore`.
 
 ### Run

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Tuple
 
 import requests
 
@@ -26,6 +27,12 @@ load_dotenv(Path(__file__).with_name(".env"))
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 NODE_NAME = os.getenv("PVE_NODE_NAME", "node1").strip()
+FAIL_ON_CRITICAL_ALERTS = os.getenv("FAIL_ON_CRITICAL_ALERTS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def run_command(command: str) -> str:
@@ -69,6 +76,56 @@ def get_vm_stats() -> str:
     return "\n".join(report_lines) if report_lines else "No VMs running."
 
 
+def get_sensor_alerts() -> Tuple[str, bool]:
+    try:
+        output = run_command("ipmitool sdr list")
+    except subprocess.CalledProcessError:
+        return "Unable to read sensors (check IPMI connection).", False
+
+    alerts = []
+    critical_detected = False
+    ok_statuses = {"ok", "ns", "na", "disabled"}
+
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+
+        name, reading, status = parts[0], parts[1], parts[2]
+        status_lower = status.lower()
+        reading_lower = reading.lower()
+        name_lower = name.lower()
+
+        if status_lower in ok_statuses:
+            continue
+
+        alerts.append(f"• *{name}*: {status} ({reading})")
+
+        status_tokens = (
+            status_lower.replace(",", " ").replace("/", " ").replace("|", " ").split()
+        )
+        critical_status_tokens = {"cr", "nr", "lnr", "unr", "lcr", "ucr"}
+        is_critical = (
+            any(token in status_tokens for token in critical_status_tokens)
+            or ("critical" in status_lower and "non-critical" not in status_lower)
+            or "failure" in reading_lower
+            or ("ps" in name_lower and "fail" in reading_lower)
+        )
+        if is_critical:
+            critical_detected = True
+
+    if not alerts:
+        return "No sensor anomalies detected.", False
+
+    max_alerts = 10
+    displayed_alerts = alerts[:max_alerts]
+    remaining = len(alerts) - len(displayed_alerts)
+    if remaining > 0:
+        displayed_alerts.append(f"• ... and {remaining} more alert(s)")
+
+    return "\n".join(displayed_alerts), critical_detected
+
+
 def main() -> int:
     if not SLACK_WEBHOOK_URL:
         print("SLACK_WEBHOOK_URL is not set.", file=sys.stderr)
@@ -76,12 +133,14 @@ def main() -> int:
 
     power = get_power_usage()
     vm_report = get_vm_stats()
+    sensor_report, critical_alert_detected = get_sensor_alerts()
 
     payload = {
         "text": (
             f"🖥️ *Daily Lab Island Report - {NODE_NAME}*\n\n"
             f"⚡ *Power Draw*: {power}\n"
-            f"📦 *Active VM Resources*:\n{vm_report}"
+            f"📦 *Active VM Resources*:\n{vm_report}\n\n"
+            f"🚨 *Sensor Alerts*:\n{sensor_report}"
         )
     }
 
@@ -91,6 +150,10 @@ def main() -> int:
     except requests.RequestException as exc:
         print(f"Failed to post to Slack: {exc}", file=sys.stderr)
         return 1
+
+    if critical_alert_detected and FAIL_ON_CRITICAL_ALERTS:
+        print("Critical sensor alert detected.", file=sys.stderr)
+        return 2
 
     return 0
 
