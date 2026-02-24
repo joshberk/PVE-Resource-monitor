@@ -35,6 +35,12 @@ FAIL_ON_CRITICAL_ALERTS = os.getenv("FAIL_ON_CRITICAL_ALERTS", "false").strip().
 }
 
 
+_CMD_ENV = {
+    **os.environ,
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+
+
 def run_command(command: str) -> str:
     result = subprocess.run(
         command,
@@ -43,6 +49,7 @@ def run_command(command: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=_CMD_ENV,
     )
     return result.stdout.strip()
 
@@ -79,7 +86,7 @@ def get_power_usage() -> str:
     except subprocess.CalledProcessError:
         return "N/A (Check IPMI connection)"
 
-    return "N/A (DCMI unsupported and no power sensor found)"
+    return "N/A (DCMI unsupported; no watt-based sensor found)"
 
 
 def get_vm_stats() -> str:
