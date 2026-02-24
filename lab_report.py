@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -9,6 +10,22 @@ from pathlib import Path
 from typing import Tuple
 
 import requests
+
+
+def _safe_float(s: str) -> "float | None":
+    """Parse a float from an IPMI string, rejecting NaN and Infinity."""
+    try:
+        val = float(s.split()[0])
+        return val if math.isfinite(val) else None
+    except (ValueError, IndexError):
+        return None
+
+
+def _slack_escape(text: str) -> str:
+    """Escape Slack mrkdwn special characters in user-supplied strings."""
+    for ch in ("&", "<", ">", "*", "_", "`", "~"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -73,22 +90,29 @@ if SLACK_WEBHOOK_URL and not SLACK_WEBHOOK_URL.startswith("https://hooks.slack.c
 
 HISTORY_FILE = Path(__file__).with_name("health_history.json")
 
+# Minimal allowlisted environment for subprocesses — never inherit LD_PRELOAD,
+# LD_LIBRARY_PATH, BASH_ENV, or other dangerous vars from the caller.
 _CMD_ENV = {
-    **os.environ,
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME": os.environ.get("HOME", "/root"),
+    "LANG": os.environ.get("LANG", "C"),
 }
 
 
-def run_command(args: list) -> str:
-    result = subprocess.run(
-        args,
-        shell=False,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=_CMD_ENV,
-    )
+def run_command(args: list, timeout: int = 30) -> str:
+    try:
+        result = subprocess.run(
+            args,
+            shell=False,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_CMD_ENV,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise subprocess.CalledProcessError(1, args) from exc
     return result.stdout.strip()
 
 
@@ -135,10 +159,13 @@ def get_vm_stats() -> str:
     report_lines = []
     for vm in vms:
         if vm.get("status") == "running":
-            cpu = round(float(vm.get("cpu", 0)) * 100, 1)
-            ram = round(float(vm.get("mem", 0)) / 1024**3, 2)
+            try:
+                cpu = round(float(vm.get("cpu", 0)) * 100, 1)
+                ram = round(float(vm.get("mem", 0)) / 1024**3, 2)
+            except (ValueError, TypeError):
+                continue
             name = vm.get("name") or f"vm-{vm.get('vmid', 'unknown')}"
-            report_lines.append(f"• *{name}*: CPU: {cpu}% | RAM: {ram}GB")
+            report_lines.append(f"• *{_slack_escape(str(name))}*: CPU: {cpu}% | RAM: {ram}GB")
 
     return "\n".join(report_lines) if report_lines else "No VMs running."
 
@@ -181,23 +208,21 @@ def get_health_snapshot(sdr_data: dict) -> Tuple[str, dict]:
         lines.append(f"• *Fans*: {fan_str}")
     lines.append(f"• *VBAT*: {vbat_str or 'N/A'}")
 
-    # Parse floats for threshold checking and history
+    # Parse floats for threshold checking and history.
+    # _safe_float rejects NaN/Infinity to prevent history file corruption.
     numeric: dict = {}
     if temp_str:
-        try:
-            numeric["system_temp"] = float(temp_str.split()[0])
-        except (ValueError, IndexError):
-            pass
+        val = _safe_float(temp_str)
+        if val is not None:
+            numeric["system_temp"] = val
     for k, v in fans.items():
-        try:
-            numeric[k.lower().replace(" ", "_")] = float(v.split()[0])
-        except (ValueError, IndexError):
-            pass
+        val = _safe_float(v)
+        if val is not None:
+            numeric[k.lower().replace(" ", "_")] = val
     if vbat_str:
-        try:
-            numeric["vbat"] = float(vbat_str.split()[0])
-        except (ValueError, IndexError):
-            pass
+        val = _safe_float(vbat_str)
+        if val is not None:
+            numeric["vbat"] = val
 
     return "\n".join(lines), numeric
 
@@ -220,7 +245,7 @@ def get_sensor_alerts(sdr_output: str) -> Tuple[str, bool]:
         if status_lower in ok_statuses:
             continue
 
-        alerts.append(f"• *{name}*: {status} ({reading})")
+        alerts.append(f"• *{_slack_escape(name)}*: {_slack_escape(status)} ({_slack_escape(reading)})")
 
         status_tokens = (
             status_lower.replace(",", " ").replace("/", " ").replace("|", " ").split()
@@ -291,7 +316,10 @@ def get_trend_chart() -> str:
     except (json.JSONDecodeError, OSError):
         return "Unable to read history file."
 
-    recent = [e for e in history if "system_temp" in e][-7:]
+    recent = [
+        e for e in history
+        if isinstance(e.get("system_temp"), (int, float)) and math.isfinite(e["system_temp"])
+    ][-7:]
     if not recent:
         return "No temperature history available yet."
 
@@ -404,7 +432,8 @@ def main() -> int:
     if threshold_alerts:
         report += "\n\n⚠️ *Threshold Alerts*:\n" + "\n".join(threshold_alerts)
 
-    send_slack(report)
+    if not send_slack(report):
+        print("Warning: daily report was not delivered to Slack.", file=sys.stderr)
 
     # Send a separate urgent message for critical threshold breaches
     if threshold_critical:
@@ -413,7 +442,8 @@ def main() -> int:
             + "\n".join(threshold_alerts)
             + "\n\nCheck the server immediately."
         )
-        send_slack(urgent)
+        if not send_slack(urgent):
+            print("Warning: urgent alert was not delivered to Slack.", file=sys.stderr)
 
     if (critical_alert_detected or threshold_critical) and FAIL_ON_CRITICAL_ALERTS:
         print("Critical alert detected.", file=sys.stderr)
