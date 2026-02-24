@@ -48,13 +48,38 @@ def run_command(command: str) -> str:
 
 
 def get_power_usage() -> str:
+    dcmi_cmd = "ipmitool -I open dcmi power reading"
     try:
-        # Supermicro specific IPMI command for real-time power.
-        cmd = "ipmitool dcmi power reading | grep 'Instantaneous' | awk '{print $4}'"
-        watts = run_command(cmd)
-        return f"{watts} Watts" if watts else "N/A (No reading returned)"
+        output = run_command(dcmi_cmd)
+        for line in output.splitlines():
+            if "Instantaneous power reading" in line and ":" in line:
+                reading = line.split(":", 1)[1].strip()
+                if reading:
+                    return reading
+        if output:
+            return "N/A (DCMI supported, but no instantaneous reading returned)"
+    except subprocess.CalledProcessError:
+        pass
+
+    # Some platforms do not support DCMI power reading; attempt sensor fallback.
+    try:
+        sensor_output = run_command("ipmitool -I open sensor")
+        for line in sensor_output.splitlines():
+            lowered = line.lower()
+            if "watt" not in lowered and "power" not in lowered:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 2:
+                continue
+            value = parts[1]
+            if value and value.lower() not in {"na", "n/a"}:
+                if "watt" in value.lower():
+                    return value
+                return f"{value} Watts"
     except subprocess.CalledProcessError:
         return "N/A (Check IPMI connection)"
+
+    return "N/A (DCMI unsupported and no power sensor found)"
 
 
 def get_vm_stats() -> str:
@@ -78,7 +103,7 @@ def get_vm_stats() -> str:
 
 def get_sensor_alerts() -> Tuple[str, bool]:
     try:
-        output = run_command("ipmitool sdr list")
+        output = run_command("ipmitool -I open sdr list")
     except subprocess.CalledProcessError:
         return "Unable to read sensors (check IPMI connection).", False
 
