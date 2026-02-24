@@ -377,5 +377,47 @@ def main() -> int:
     return 0
 
 
+def install_cron(hour: int = 8) -> int:
+    script_path = Path(__file__).resolve()
+    python = sys.executable
+    log_path = script_path.with_suffix(".log")
+    cron_entry = f"0 {hour} * * * {python} {script_path} >> {log_path} 2>&1"
+
+    # Read existing crontab (crontab -l exits non-zero when empty, so don't check=True)
+    result = subprocess.run(
+        "crontab -l",
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    existing = result.stdout if result.returncode == 0 else ""
+
+    if str(script_path) in existing:
+        print(f"Cron job already installed for {script_path}")
+        return 0
+
+    new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
+
+    install = subprocess.run(
+        "crontab -",
+        input=new_crontab,
+        shell=True,
+        text=True,
+    )
+
+    if install.returncode == 0:
+        print(f"Cron job installed successfully.")
+        print(f"  Schedule : daily at {hour:02d}:00")
+        print(f"  Script   : {script_path}")
+        print(f"  Log file : {log_path}")
+        return 0
+
+    print("Failed to install cron job.", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
+    if "--install-cron" in sys.argv:
+        raise SystemExit(install_cron())
     raise SystemExit(main())
