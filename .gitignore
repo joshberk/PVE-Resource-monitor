@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .env
+health_history.json
+lab_report.log
