@@ -56,8 +56,8 @@ VBAT_WARN_V=2.7
 
 | Variable | Default | Description |
 |---|---|---|
-| `SLACK_WEBHOOK_URL` | — | **Required.** Slack incoming webhook URL |
-| `PVE_NODE_NAME` | `node1` | Proxmox node name used in `pvesh` queries |
+| `SLACK_WEBHOOK_URL` | — | **Required.** Must start with `https://hooks.slack.com/` |
+| `PVE_NODE_NAME` | `node1` | Proxmox node name — letters, numbers, hyphens, underscores only |
 | `FAIL_ON_CRITICAL_ALERTS` | `false` | Exit with code `2` on critical alerts (useful for monitoring pipelines) |
 | `TEMP_WARN_C` | `40` | System temp warning threshold (°C) |
 | `TEMP_CRIT_C` | `50` | System temp critical threshold (°C) |
@@ -72,7 +72,7 @@ Install the cron job directly from the script — no manual crontab editing need
 python3 /path/to/lab_report.py --install-cron
 ```
 
-This registers a daily 08:00 cron job and writes logs to `lab_report.log` in the same directory. Running it again is safe — it will not add a duplicate entry.
+This registers a daily 08:00 cron job, writes logs to `lab_report.log` in the same directory, and creates `/etc/logrotate.d/pve-resource-monitor` to rotate logs automatically (7-day retention). Running it again is safe — it will not add a duplicate entry.
 
 ## Run manually
 
@@ -111,4 +111,4 @@ If a critical threshold is breached, a **second urgent message** is sent immedia
 
 - Power draw via DCMI (`ipmitool dcmi power reading`) is hardware-dependent. Boards without an inline power meter (e.g. Supermicro H8DGT) will report `N/A`.
 - `.env` is excluded from git via `.gitignore` to prevent credential exposure.
-- History is stored in `health_history.json` next to the script (last 30 days).
+- History is stored in `health_history.json` next to the script (last 30 days), created with `0600` permissions (owner-read/write only).
