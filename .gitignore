@@ -3,3 +3,4 @@ __pycache__/
 .env
 health_history.json
 lab_report.log
+.claude/

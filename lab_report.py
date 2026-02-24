@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,12 @@ def load_dotenv(dotenv_path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip().strip("'").strip('"')
+        value = value.strip()
+        # Strip inline comments from unquoted values (e.g. KEY=value # comment)
+        if value and value[0] not in ("'", '"'):
+            value = value.split(" #")[0].rstrip()
+        else:
+            value = value.strip("'").strip('"')
         if key and key not in os.environ:
             os.environ[key] = value
 
@@ -32,11 +38,38 @@ FAIL_ON_CRITICAL_ALERTS = os.getenv("FAIL_ON_CRITICAL_ALERTS", "false").strip().
     "1", "true", "yes", "on",
 }
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        print(f"Warning: {name} has an invalid value; using default {default}.", file=sys.stderr)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        print(f"Warning: {name} has an invalid value; using default {default}.", file=sys.stderr)
+        return default
+
+
 # Health alert thresholds (override via .env)
-TEMP_WARN_C = int(os.getenv("TEMP_WARN_C", "40"))
-TEMP_CRIT_C = int(os.getenv("TEMP_CRIT_C", "50"))
-FAN_MIN_RPM = int(os.getenv("FAN_MIN_RPM", "500"))
-VBAT_WARN_V = float(os.getenv("VBAT_WARN_V", "2.7"))
+TEMP_WARN_C = _env_int("TEMP_WARN_C", 40)
+TEMP_CRIT_C = _env_int("TEMP_CRIT_C", 50)
+FAN_MIN_RPM = _env_int("FAN_MIN_RPM", 500)
+VBAT_WARN_V = _env_float("VBAT_WARN_V", 2.7)
+
+if not re.fullmatch(r"[a-zA-Z0-9_-]+", NODE_NAME):
+    print(
+        f"Invalid PVE_NODE_NAME '{NODE_NAME}': only letters, numbers, hyphens, and underscores are allowed.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if SLACK_WEBHOOK_URL and not SLACK_WEBHOOK_URL.startswith("https://hooks.slack.com/"):
+    print("SLACK_WEBHOOK_URL does not look like a Slack webhook URL.", file=sys.stderr)
+    sys.exit(1)
 
 HISTORY_FILE = Path(__file__).with_name("health_history.json")
 
@@ -46,10 +79,10 @@ _CMD_ENV = {
 }
 
 
-def run_command(command: str) -> str:
+def run_command(args: list) -> str:
     result = subprocess.run(
-        command,
-        shell=True,
+        args,
+        shell=False,
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -61,7 +94,7 @@ def run_command(command: str) -> str:
 
 def get_power_usage() -> str:
     try:
-        output = run_command("ipmitool -I open dcmi power reading")
+        output = run_command(["ipmitool", "-I", "open", "dcmi", "power", "reading"])
         for line in output.splitlines():
             if "Instantaneous power reading" in line and ":" in line:
                 reading = line.split(":", 1)[1].strip()
@@ -73,7 +106,7 @@ def get_power_usage() -> str:
         pass
 
     try:
-        sensor_output = run_command("ipmitool -I open sensor")
+        sensor_output = run_command(["ipmitool", "-I", "open", "sensor"])
         for line in sensor_output.splitlines():
             lowered = line.lower()
             if "watt" not in lowered and "power" not in lowered:
@@ -94,8 +127,7 @@ def get_power_usage() -> str:
 
 def get_vm_stats() -> str:
     try:
-        cmd = f"pvesh get /nodes/{NODE_NAME}/qemu --output-format json"
-        output = run_command(cmd)
+        output = run_command(["pvesh", "get", f"/nodes/{NODE_NAME}/qemu", "--output-format", "json"])
         vms = json.loads(output)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return "Unable to read VM stats (check pvesh/node name)."
@@ -231,8 +263,21 @@ def save_to_history(numeric: dict) -> None:
     history.append(entry)
     history = history[-30:]  # keep last 30 days
 
+    # Write atomically via a temp file then rename, and lock to 0o600 (owner-only).
+    # This prevents a race condition if two instances run concurrently and prevents
+    # other local users from reading historical sensor/VM data.
+    import tempfile
     try:
-        HISTORY_FILE.write_text(json.dumps(history, indent=2))
+        fd, tmp_str = tempfile.mkstemp(dir=HISTORY_FILE.parent, suffix=".tmp")
+        tmp_path = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(history, f, indent=2)
+            os.chmod(tmp_path, 0o600)
+            tmp_path.rename(HISTORY_FILE)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            raise
     except OSError as exc:
         print(f"Warning: could not write history file: {exc}", file=sys.stderr)
 
@@ -323,7 +368,7 @@ def main() -> int:
 
     # Run ipmitool sdr once and share the output
     try:
-        sdr_output = run_command("ipmitool -I open sdr list")
+        sdr_output = run_command(["ipmitool", "-I", "open", "sdr", "list"])
     except subprocess.CalledProcessError:
         sdr_output = ""
 
@@ -378,6 +423,10 @@ def main() -> int:
 
 
 def install_cron(hour: int = 8) -> int:
+    if not 0 <= hour <= 23:
+        print(f"Invalid hour '{hour}': must be 0–23.", file=sys.stderr)
+        return 1
+
     script_path = Path(__file__).resolve()
     python = sys.executable
     log_path = script_path.with_suffix(".log")
@@ -385,8 +434,8 @@ def install_cron(hour: int = 8) -> int:
 
     # Read existing crontab (crontab -l exits non-zero when empty, so don't check=True)
     result = subprocess.run(
-        "crontab -l",
-        shell=True,
+        ["crontab", "-l"],
+        shell=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -400,21 +449,40 @@ def install_cron(hour: int = 8) -> int:
     new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
 
     install = subprocess.run(
-        "crontab -",
+        ["crontab", "-"],
+        shell=False,
         input=new_crontab,
-        shell=True,
         text=True,
     )
 
-    if install.returncode == 0:
-        print(f"Cron job installed successfully.")
-        print(f"  Schedule : daily at {hour:02d}:00")
-        print(f"  Script   : {script_path}")
-        print(f"  Log file : {log_path}")
-        return 0
+    if install.returncode != 0:
+        print("Failed to install cron job.", file=sys.stderr)
+        return 1
 
-    print("Failed to install cron job.", file=sys.stderr)
-    return 1
+    print("Cron job installed successfully.")
+    print(f"  Schedule : daily at {hour:02d}:00")
+    print(f"  Script   : {script_path}")
+    print(f"  Log file : {log_path}")
+
+    # Write a logrotate config to prevent unbounded log growth.
+    logrotate_conf = (
+        f"{log_path} {{\n"
+        f"    daily\n"
+        f"    rotate 7\n"
+        f"    compress\n"
+        f"    missingok\n"
+        f"    notifempty\n"
+        f"}}\n"
+    )
+    logrotate_path = Path("/etc/logrotate.d/pve-resource-monitor")
+    try:
+        logrotate_path.write_text(logrotate_conf)
+        logrotate_path.chmod(0o644)
+        print(f"  Log rotate: {logrotate_path} (7-day rotation, compressed)")
+    except OSError:
+        print("  Note: could not write logrotate config — set up log rotation manually.")
+
+    return 0
 
 
 if __name__ == "__main__":
