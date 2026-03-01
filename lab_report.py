@@ -71,11 +71,15 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Health alert thresholds (override via .env)
-TEMP_WARN_C = _env_int("TEMP_WARN_C", 40)
-TEMP_CRIT_C = _env_int("TEMP_CRIT_C", 50)
-FAN_MIN_RPM = _env_int("FAN_MIN_RPM", 500)
-VBAT_WARN_V = _env_float("VBAT_WARN_V", 2.7)
+# Health alert thresholds for Dell PowerEdge R830 (override via .env)
+INLET_WARN_C   = _env_int("INLET_WARN_C",   30)   # Ambient/inlet air temp
+INLET_CRIT_C   = _env_int("INLET_CRIT_C",   40)
+EXHAUST_WARN_C = _env_int("EXHAUST_WARN_C", 55)   # Hot exhaust air
+EXHAUST_CRIT_C = _env_int("EXHAUST_CRIT_C", 70)
+CPU_WARN_C     = _env_int("CPU_WARN_C",     75)   # CPU die temp (Xeon E7)
+CPU_CRIT_C     = _env_int("CPU_CRIT_C",     85)
+FAN_MIN_RPM    = _env_int("FAN_MIN_RPM",  1000)   # Dell fans run at higher RPM
+VBAT_WARN_V    = _env_float("VBAT_WARN_V",  2.7)
 
 if not re.fullmatch(r"[a-zA-Z0-9_-]+", NODE_NAME):
     print(
@@ -170,25 +174,81 @@ def get_vm_stats() -> str:
     return "\n".join(report_lines) if report_lines else "No VMs running."
 
 
+def get_node_stats() -> str:
+    """Return Proxmox host CPU, memory, load, and uptime via pvesh."""
+    try:
+        output = run_command(
+            ["pvesh", "get", f"/nodes/{NODE_NAME}/status", "--output-format", "json"]
+        )
+        data = json.loads(output)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return "Unable to read node stats (check pvesh/node name)."
+
+    try:
+        cpu_pct = round(float(data.get("cpu", 0)) * 100, 1)
+        mem = data.get("memory", {})
+        mem_used = float(mem.get("used", 0)) / 1024**3
+        mem_total = float(mem.get("total", 1)) / 1024**3
+        mem_pct = round(mem_used / mem_total * 100, 1) if mem_total else 0
+        load = data.get("loadavg", ["N/A", "N/A", "N/A"])
+        uptime_s = int(data.get("uptime", 0))
+        uptime_d, remainder = divmod(uptime_s, 86400)
+        uptime_h = remainder // 3600
+    except (ValueError, TypeError, ZeroDivisionError):
+        return "Unable to parse node stats."
+
+    return (
+        f"• *CPU*: {cpu_pct}%\n"
+        f"• *Memory*: {mem_used:.1f}GB / {mem_total:.1f}GB ({mem_pct}%)\n"
+        f"• *Load (1/5/15m)*: {load[0]} / {load[1]} / {load[2]}\n"
+        f"• *Uptime*: {uptime_d}d {uptime_h}h"
+    )
+
+
 # ---------------------------------------------------------------------------
 # SDR parsing — run ipmitool once and share output across functions
 # ---------------------------------------------------------------------------
 
 def _parse_sdr(sdr_output: str) -> dict:
-    """Extract system temp, fans, and VBAT from raw sdr list output."""
-    data: dict = {"system_temp": None, "fans": {}, "vbat": None}
+    """Extract thermal, fan, PSU, and battery readings from ipmitool sdr list output.
+
+    Handles Dell PowerEdge R830 sensor naming conventions:
+      Inlet Temp / Ambient Temp — inlet airflow temperature
+      Exhaust Temp              — hot-aisle exhaust temperature
+      CPU1 Temp … CPU4 Temp    — per-socket die temperatures
+      Fan1 RPM, Fan2A RPM …    — individual fan readings
+      PS1 Status, PS2 Status   — PSU presence / health
+      VBAT                     — CMOS battery voltage
+    """
+    data: dict = {
+        "inlet_temp":   None,
+        "exhaust_temp": None,
+        "cpu_temps":    {},
+        "fans":         {},
+        "vbat":         None,
+        "psu":          {},
+    }
     for line in sdr_output.splitlines():
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 2:
             continue
         name, reading = parts[0], parts[1]
         name_lower = name.lower()
-        if "system temp" in name_lower:
-            data["system_temp"] = reading
+
+        if "inlet" in name_lower or "ambient" in name_lower:
+            data["inlet_temp"] = reading
+        elif "exhaust" in name_lower:
+            data["exhaust_temp"] = reading
+        elif re.search(r"cpu\d*\s*temp", name_lower):
+            data["cpu_temps"][name] = reading
         elif name_lower.startswith("fan"):
             data["fans"][name] = reading
         elif "vbat" in name_lower:
             data["vbat"] = reading
+        elif re.match(r"ps\d", name_lower) and any(
+            w in name_lower for w in ("status", "power", "pwr")
+        ):
+            data["psu"][name] = reading
     return data
 
 
@@ -197,24 +257,49 @@ def get_health_snapshot(sdr_data: dict) -> Tuple[str, dict]:
     Build the snapshot display string and parse numeric values.
     Returns (display_str, numeric_dict).
     """
-    temp_str = sdr_data["system_temp"]
-    fans = sdr_data["fans"]
-    vbat_str = sdr_data["vbat"]
+    inlet_str   = sdr_data["inlet_temp"]
+    exhaust_str = sdr_data["exhaust_temp"]
+    cpu_temps   = sdr_data["cpu_temps"]
+    fans        = sdr_data["fans"]
+    vbat_str    = sdr_data["vbat"]
+    psu         = sdr_data["psu"]
 
     lines = []
-    lines.append(f"• *System Temp*: {temp_str or 'N/A'}")
+
+    # Airflow temperatures
+    airflow = f"• *Inlet*: {inlet_str or 'N/A'}"
+    if exhaust_str:
+        airflow += f" | *Exhaust*: {exhaust_str}"
+    lines.append(airflow)
+
+    # Per-socket CPU temps
+    if cpu_temps:
+        cpu_str = " | ".join(f"{k}: {v}" for k, v in sorted(cpu_temps.items()))
+        lines.append(f"• *CPU Temps*: {cpu_str}")
+
+    # Fans
     if fans:
         fan_str = " | ".join(f"{k}: {v}" for k, v in sorted(fans.items()))
         lines.append(f"• *Fans*: {fan_str}")
+
+    # PSU
+    if psu:
+        psu_str = " | ".join(f"{k}: {v}" for k, v in sorted(psu.items()))
+        lines.append(f"• *PSU*: {psu_str}")
+
     lines.append(f"• *VBAT*: {vbat_str or 'N/A'}")
 
-    # Parse floats for threshold checking and history.
-    # _safe_float rejects NaN/Infinity to prevent history file corruption.
+    # Parse floats — _safe_float rejects NaN/Infinity to prevent history corruption
     numeric: dict = {}
-    if temp_str:
-        val = _safe_float(temp_str)
+    for key, raw in (("inlet_temp", inlet_str), ("exhaust_temp", exhaust_str)):
+        if raw:
+            val = _safe_float(raw)
+            if val is not None:
+                numeric[key] = val
+    for k, v in cpu_temps.items():
+        val = _safe_float(v)
         if val is not None:
-            numeric["system_temp"] = val
+            numeric[k.lower().replace(" ", "_")] = val
     for k, v in fans.items():
         val = _safe_float(v)
         if val is not None:
@@ -316,20 +401,24 @@ def get_trend_chart() -> str:
     except (json.JSONDecodeError, OSError):
         return "Unable to read history file."
 
+    # Use inlet_temp (R830) if present, fall back to system_temp (legacy)
+    temp_key = "inlet_temp" if any("inlet_temp" in e for e in history) else "system_temp"
+    label = "Inlet Temp" if temp_key == "inlet_temp" else "System Temp"
+
     recent = [
         e for e in history
-        if isinstance(e.get("system_temp"), (int, float)) and math.isfinite(e["system_temp"])
+        if isinstance(e.get(temp_key), (int, float)) and math.isfinite(e[temp_key])
     ][-7:]
     if not recent:
         return "No temperature history available yet."
 
-    max_temp = max(e["system_temp"] for e in recent)
+    max_temp = max(e[temp_key] for e in recent)
     bar_scale = 20
 
-    lines = ["*System Temp — Last 7 Days:*"]
+    lines = [f"*{label} — Last 7 Days:*"]
     for i, entry in enumerate(recent):
         date = entry["date"][5:]  # MM-DD
-        temp = entry["system_temp"]
+        temp = entry[temp_key]
         bar_len = int((temp / max(max_temp, 1)) * bar_scale)
         bar = "█" * bar_len + "░" * (bar_scale - bar_len)
         marker = " ← today" if i == len(recent) - 1 else ""
@@ -350,20 +439,42 @@ def check_health_thresholds(numeric: dict) -> Tuple[list, bool]:
     alerts = []
     is_critical = False
 
-    temp = numeric.get("system_temp")
-    if temp is not None:
-        if temp >= TEMP_CRIT_C:
-            alerts.append(f"🔥 *CRITICAL*: System Temp {temp:.0f}°C ≥ {TEMP_CRIT_C}°C threshold")
+    # Inlet (ambient) temperature
+    inlet = numeric.get("inlet_temp")
+    if inlet is not None:
+        if inlet >= INLET_CRIT_C:
+            alerts.append(f"🔥 *CRITICAL*: Inlet Temp {inlet:.0f}°C ≥ {INLET_CRIT_C}°C")
             is_critical = True
-        elif temp >= TEMP_WARN_C:
-            alerts.append(f"⚠️ *WARNING*: System Temp {temp:.0f}°C ≥ {TEMP_WARN_C}°C threshold")
+        elif inlet >= INLET_WARN_C:
+            alerts.append(f"⚠️ *WARNING*: Inlet Temp {inlet:.0f}°C ≥ {INLET_WARN_C}°C")
 
+    # Exhaust temperature
+    exhaust = numeric.get("exhaust_temp")
+    if exhaust is not None:
+        if exhaust >= EXHAUST_CRIT_C:
+            alerts.append(f"🔥 *CRITICAL*: Exhaust Temp {exhaust:.0f}°C ≥ {EXHAUST_CRIT_C}°C")
+            is_critical = True
+        elif exhaust >= EXHAUST_WARN_C:
+            alerts.append(f"⚠️ *WARNING*: Exhaust Temp {exhaust:.0f}°C ≥ {EXHAUST_WARN_C}°C")
+
+    # Per-socket CPU temps — keys look like "cpu1_temp", "cpu2_temp", …
     for key, val in numeric.items():
-        if key.startswith("fan_") and val < FAN_MIN_RPM:
-            label = key.replace("fan_", "FAN ").upper()
+        if re.match(r"cpu\d+_temp", key):
+            label = key.replace("_temp", "").upper()
+            if val >= CPU_CRIT_C:
+                alerts.append(f"🔥 *CRITICAL*: {label} {val:.0f}°C ≥ {CPU_CRIT_C}°C")
+                is_critical = True
+            elif val >= CPU_WARN_C:
+                alerts.append(f"⚠️ *WARNING*: {label} {val:.0f}°C ≥ {CPU_WARN_C}°C")
+
+    # Fan speeds — any key containing "fan" and below minimum RPM
+    for key, val in numeric.items():
+        if "fan" in key and val < FAN_MIN_RPM:
+            label = key.replace("_", " ").upper()
             alerts.append(f"🔥 *CRITICAL*: {label} at {val:.0f} RPM — possible fan failure")
             is_critical = True
 
+    # CMOS battery
     vbat = numeric.get("vbat")
     if vbat is not None and vbat < VBAT_WARN_V:
         alerts.append(f"⚠️ *WARNING*: VBAT {vbat:.2f}V is low (replace CMOS battery below 2.5V)")
@@ -401,6 +512,7 @@ def main() -> int:
         sdr_output = ""
 
     power = get_power_usage()
+    node_stats = get_node_stats()
     vm_report = get_vm_stats()
 
     if sdr_output:
@@ -422,7 +534,8 @@ def main() -> int:
     # Build daily report
     report = (
         f"🖥️ *Daily Lab Island Report - {NODE_NAME}*\n\n"
-        f"⚡ *Power Draw*: {power}\n"
+        f"⚡ *Power Draw*: {power}\n\n"
+        f"📊 *Node Stats*:\n{node_stats}\n\n"
         f"📦 *Active VM Resources*:\n{vm_report}\n\n"
         f"🌡️ *Health Snapshot*:\n{health_snapshot}\n\n"
         f"📈 *Trends*:\n{trend_chart}\n\n"
