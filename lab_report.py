@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 from typing import Tuple
 
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 import requests
 
 
@@ -80,6 +84,22 @@ CPU_WARN_C     = _env_int("CPU_WARN_C",     75)   # CPU die temp (Xeon E7)
 CPU_CRIT_C     = _env_int("CPU_CRIT_C",     85)
 FAN_MIN_RPM    = _env_int("FAN_MIN_RPM",  1000)   # Dell fans run at higher RPM
 VBAT_WARN_V    = _env_float("VBAT_WARN_V",  2.7)
+
+# Email notification settings (Gmail by default)
+EMAIL_FROM    = os.getenv("EMAIL_FROM", "").strip()
+EMAIL_TO      = os.getenv("EMAIL_TO", "").strip()
+SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
+SMTP_PORT     = _env_int("SMTP_PORT", 587)
+SMTP_USER     = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+
+# Power and daily runtime alert thresholds
+POWER_WARN_W          = _env_float("POWER_WARN_W",         300.0)
+POWER_CRIT_W          = _env_float("POWER_CRIT_W",         376.0)
+DAILY_RUNTIME_WARN_H  = _env_float("DAILY_RUNTIME_WARN_H",   5.5)
+DAILY_RUNTIME_LIMIT_H = _env_float("DAILY_RUNTIME_LIMIT_H",  6.0)
+
+ALERT_STATE_FILE = Path(__file__).with_name("alert_state.json")
 
 if not re.fullmatch(r"[a-zA-Z0-9_-]+", NODE_NAME):
     print(
@@ -483,6 +503,129 @@ def check_health_thresholds(numeric: dict) -> Tuple[list, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Email helpers
+# ---------------------------------------------------------------------------
+
+def send_email(subject: str, body: str) -> bool:
+    """Send a plain-text email via SMTP STARTTLS (Gmail by default)."""
+    if not (EMAIL_FROM and EMAIL_TO and SMTP_HOST):
+        print(
+            "Email not configured — set EMAIL_FROM, EMAIL_TO, SMTP_HOST in .env",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            if SMTP_USER and SMTP_PASSWORD:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        return True
+    except (smtplib.SMTPException, OSError) as exc:
+        print(f"Failed to send email: {exc}", file=sys.stderr)
+        return False
+
+
+def get_uptime_seconds() -> "int | None":
+    """Read system uptime from /proc/uptime (no subprocess needed)."""
+    try:
+        content = Path("/proc/uptime").read_text(encoding="utf-8")
+        return int(float(content.split()[0]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def parse_power_watts(power_str: str) -> "float | None":
+    """Extract a numeric watt value from strings like '250 Watts' or '250.5 W'."""
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[Ww]", power_str)
+    return float(match.group(1)) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Alert state — tracks which one-per-day emails have already been sent
+# ---------------------------------------------------------------------------
+
+def load_alert_state() -> dict:
+    """Return today's alert state, resetting if the date has changed."""
+    today = datetime.date.today().isoformat()
+    if ALERT_STATE_FILE.exists():
+        try:
+            state = json.loads(
+                ALERT_STATE_FILE.read_text(encoding="utf-8")
+            )
+            if state.get("date") == today:
+                return state
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"date": today, "power_warn_sent": False, "runtime_warn_sent": False}
+
+
+def save_alert_state(state: dict) -> None:
+    """Persist alert state to disk with owner-only permissions."""
+    try:
+        ALERT_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        os.chmod(ALERT_STATE_FILE, 0o600)
+    except OSError as exc:
+        print(f"Warning: could not write alert state: {exc}", file=sys.stderr)
+
+
+def check_and_send_alerts() -> None:
+    """Check runtime and power thresholds; send email alerts at most once per day."""
+    state = load_alert_state()
+    changed = False
+
+    # --- Daily runtime warning ---
+    uptime_s = get_uptime_seconds()
+    if uptime_s is not None and not state["runtime_warn_sent"]:
+        warn_s  = int(DAILY_RUNTIME_WARN_H  * 3600)
+        limit_s = int(DAILY_RUNTIME_LIMIT_H * 3600)
+        if warn_s <= uptime_s < limit_s:
+            hours_run = uptime_s // 3600
+            mins_run  = (uptime_s % 3600) // 60
+            remaining = round((limit_s - uptime_s) / 60)
+            subject = (
+                f"[{NODE_NAME}] Server nearing "
+                f"{DAILY_RUNTIME_LIMIT_H:.0f}h daily runtime limit"
+            )
+            body = (
+                f"{NODE_NAME} has been running for {hours_run}h {mins_run}m.\n\n"
+                f"Only ~{remaining} minutes remain before the "
+                f"{DAILY_RUNTIME_LIMIT_H:.0f}-hour daily threshold.\n\n"
+                f"Consider shutting down the server soon."
+            )
+            if send_email(subject, body):
+                state["runtime_warn_sent"] = True
+                changed = True
+                print("Runtime warning email sent.")
+
+    # --- Power consumption warning ---
+    power_str = get_power_usage()
+    watts = parse_power_watts(power_str)
+    if watts is not None and not state["power_warn_sent"]:
+        if watts >= POWER_WARN_W:
+            subject = f"[{NODE_NAME}] High power draw: {watts:.0f} W"
+            body = (
+                f"{NODE_NAME} power consumption is currently {watts:.0f} W.\n\n"
+                f"This is approaching the {POWER_CRIT_W:.0f} W limit.\n\n"
+                f"Please check the server load and consider reducing activity."
+            )
+            if send_email(subject, body):
+                state["power_warn_sent"] = True
+                changed = True
+                print(f"Power warning email sent ({watts:.0f} W).")
+
+    if changed:
+        save_alert_state(state)
+
+
+# ---------------------------------------------------------------------------
 # Slack helpers
 # ---------------------------------------------------------------------------
 
@@ -562,6 +705,7 @@ def main() -> int:
         print("Critical alert detected.", file=sys.stderr)
         return 2
 
+    check_and_send_alerts()
     return 0
 
 
@@ -628,7 +772,55 @@ def install_cron(hour: int = 8) -> int:
     return 0
 
 
+def install_monitor_cron() -> int:
+    """Install a cron job that checks alerts every 30 minutes."""
+    script_path = Path(__file__).resolve()
+    python = sys.executable
+    log_path = script_path.with_name("alert_monitor.log")
+    cron_entry = (
+        f"*/30 * * * * {python} {script_path} --check-alerts"
+        f" >> {log_path} 2>&1"
+    )
+
+    result = subprocess.run(
+        ["crontab", "-l"],
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    existing = result.stdout if result.returncode == 0 else ""
+
+    marker = f"{script_path} --check-alerts"
+    if marker in existing:
+        print("Alert monitor cron job is already installed.")
+        return 0
+
+    new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
+    install = subprocess.run(
+        ["crontab", "-"],
+        shell=False,
+        input=new_crontab,
+        text=True,
+    )
+
+    if install.returncode != 0:
+        print("Failed to install monitor cron job.", file=sys.stderr)
+        return 1
+
+    print("Alert monitor cron job installed successfully.")
+    print("  Schedule : every 30 minutes")
+    print(f"  Script   : {script_path} --check-alerts")
+    print(f"  Log file : {log_path}")
+    return 0
+
+
 if __name__ == "__main__":
     if "--install-cron" in sys.argv:
         raise SystemExit(install_cron())
+    if "--install-monitor-cron" in sys.argv:
+        raise SystemExit(install_monitor_cron())
+    if "--check-alerts" in sys.argv:
+        check_and_send_alerts()
+        raise SystemExit(0)
     raise SystemExit(main())
